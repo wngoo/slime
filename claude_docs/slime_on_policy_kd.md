@@ -89,15 +89,15 @@ L[t] = −A_modified[t] × log π_student(t_t|t_<t)
 
 ## 3. 스크립트 설정 요약
 
-| 항목 | 값 | 의미 |
-|------|-----|------|
-| `--opd-kl-coef` | 1.0 | reverse KL penalty 가중치 |
-| `--kl-loss-coef` | 0.00 | reference model과의 KL loss는 **비활성** |
-| `--advantage-estimator` | grpo | base advantage는 GRPO |
-| reward | 0.0 (고정) | task reward 없음, 학습 신호 전부 OPD KL에서 |
-| logprobs 수 | response 길이 × batch | 포지션별 1개, 최대 16,384개/샘플 |
-| teacher logprob 계산 시점 | rollout 단계 | SGLang 서버에서 비동기로 수집 |
-| student logprob 계산 시점 | training forward | Megatron에서 현재 policy로 계산 |
+| 항목                      | 값                    | 의미                                        |
+| ------------------------- | --------------------- | ------------------------------------------- |
+| `--opd-kl-coef`           | 1.0                   | reverse KL penalty 가중치                   |
+| `--kl-loss-coef`          | 0.00                  | reference model과의 KL loss는 **비활성**    |
+| `--advantage-estimator`   | grpo                  | base advantage는 GRPO                       |
+| reward                    | 0.0 (고정)            | task reward 없음, 학습 신호 전부 OPD KL에서 |
+| logprobs 수               | response 길이 × batch | 포지션별 1개, 최대 16,384개/샘플            |
+| teacher logprob 계산 시점 | rollout 단계          | SGLang 서버에서 비동기로 수집               |
+| student logprob 계산 시점 | training forward      | Megatron에서 현재 policy로 계산             |
 
 ---
 
@@ -105,13 +105,14 @@ L[t] = −A_modified[t] × log π_student(t_t|t_<t)
 
 README의 References:
 
-| # | 링크 | 정체 |
-|---|------|------|
-| 1 | thinkingmachines.ai/blog/on-policy-distillation/ | Thinking Machines Lab 블로그 + 구현 코드 |
-| 2 | arxiv.org/abs/2306.13649 | **GKD** (Generalized Knowledge Distillation for Auto-regressive Sequence Models, Agarwal et al., Google DeepMind, 2023) |
-| 3 | arxiv.org/abs/2306.08543 | **DistiLLM** (Ko et al., 2023) |
+| #   | 링크                                             | 정체                                                                                                                    |
+| --- | ------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------- |
+| 1   | thinkingmachines.ai/blog/on-policy-distillation/ | Thinking Machines Lab 블로그 + 구현 코드                                                                                |
+| 2   | arxiv.org/abs/2306.13649                         | **GKD** (Generalized Knowledge Distillation for Auto-regressive Sequence Models, Agarwal et al., Google DeepMind, 2023) |
+| 3   | arxiv.org/abs/2306.08543                         | **DistiLLM** (Ko et al., 2023)                                                                                          |
 
 `apply_opd_kl_to_advantages`의 docstring References에도 아래가 명시되어 있습니다:
+
 ```
 https://github.com/thinking-machines-lab/tinker-cookbook/.../train_on_policy.py
 ```
@@ -151,3 +152,40 @@ GKD 원논문 대비 slime이 추가한 설계 결정:
 - **Advantage에 additive penalty로 통합**: KD를 별도 loss term이 아닌 advantage에 녹여서, **어떤 advantage estimator(GRPO, PPO, REINFORCE++ 등)와도 조합 가능**하게 만든 것이 핵심
 - **Task reward = 0.0**: 순수 distillation 목적이면 task reward를 주지 않고 KL signal만 사용
 - **Teacher를 외부 SGLang 서버로 분리**: 아키텍처가 달라도(Qwen3-32B → Qwen3-8B) 적용 가능
+
+### 왜 GRPO를 쓸까?
+
+README에도 명시되어 있듯이:  
+ ▎ "OPD is orthogonal to advantage estimators" — OPD works as an additive KL penalty on top of any advantage estimator (GRPO, PPO, REINFORCE++, etc.), not as a separate estimator.
+
+즉 OPD는 advantage estimator를 대체하는 게 아니라 그 위에 더해지는 구조입니다. GRPO를 쓰든, PPO를 쓰든 상관없이 동작합니다.
+
+이 스크립트에서 reward = 0.0 (고정)이므로 GRPO가 계산하는 base advantage는 사실상 0이 됩니다:
+
+A_base[t] ≈ 0 (모든 샘플 reward가 동일하게 0이므로 GRPO 정규화 후 0)
+A_modified[t] = 0 − 1.0 × (log π_S[t] − log π_T[t])
+= −(log π_S[t] − log π_T[t])
+
+결과적으로 loss는 순수하게 student를 teacher 쪽으로 끌어당기는 reverse KL만 남습니다.
+
+그럼 왜 굳이 GRPO를 쓰나?
+
+1. 확장성: 나중에 task reward를 추가하고 싶으면 scalar_rewards = [0.0] 부분만 실제 reward 함수로 교체하면 됩니다. GRPO + OPD 조합이 그대로 유지됩니다.
+2. 아키텍처 요구사항: slime의 training loop은 반드시 advantage estimator가 지정되어야 합니다. OPD 자체는 별도 estimator가 아니므로 어떤 estimator든 하나를 골라야 합니다.
+3. 순수 KD만 원한다면 GRPO는 사실 dummy 역할을 하는 것이고, 실제 학습 신호는 100% OPD KL에서 옵니다.
+
+---
+
+## 5. 왜 GRPO를 Advantage Estimator로 사용하는가
+
+README에 명시된 대로 OPD는 advantage estimator와 **직교(orthogonal)**합니다:
+> "OPD works as an additive KL penalty on top of any advantage estimator (GRPO, PPO, REINFORCE++, etc.), not as a separate estimator."
+
+reward=0.0(고정)이므로 GRPO base advantage는 사실상 0이 되고:
+- A_modified[t] = 0 − coef × (log π_S[t] − log π_T[t]) = −reverse_KL[t]
+- 학습 신호 100%가 OPD KL에서 나옴
+
+GRPO를 선택한 이유:
+1. **확장성**: task reward를 나중에 추가하면 GRPO+OPD 조합이 그대로 동작
+2. **아키텍처 요구사항**: slime training loop은 advantage estimator가 반드시 필요, OPD 자체는 estimator가 아니므로 dummy로 하나를 지정
+3. 어떤 estimator를 골라도 동일하게 동작
