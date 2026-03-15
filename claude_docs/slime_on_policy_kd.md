@@ -153,39 +153,98 @@ GKD 원논문 대비 slime이 추가한 설계 결정:
 - **Task reward = 0.0**: 순수 distillation 목적이면 task reward를 주지 않고 KL signal만 사용
 - **Teacher를 외부 SGLang 서버로 분리**: 아키텍처가 달라도(Qwen3-32B → Qwen3-8B) 적용 가능
 
-### 왜 GRPO를 쓸까?
-
-README에도 명시되어 있듯이:  
- ▎ "OPD is orthogonal to advantage estimators" — OPD works as an additive KL penalty on top of any advantage estimator (GRPO, PPO, REINFORCE++, etc.), not as a separate estimator.
-
-즉 OPD는 advantage estimator를 대체하는 게 아니라 그 위에 더해지는 구조입니다. GRPO를 쓰든, PPO를 쓰든 상관없이 동작합니다.
-
-이 스크립트에서 reward = 0.0 (고정)이므로 GRPO가 계산하는 base advantage는 사실상 0이 됩니다:
-
-A_base[t] ≈ 0 (모든 샘플 reward가 동일하게 0이므로 GRPO 정규화 후 0)
-A_modified[t] = 0 − 1.0 × (log π_S[t] − log π_T[t])
-= −(log π_S[t] − log π_T[t])
-
-결과적으로 loss는 순수하게 student를 teacher 쪽으로 끌어당기는 reverse KL만 남습니다.
-
-그럼 왜 굳이 GRPO를 쓰나?
-
-1. 확장성: 나중에 task reward를 추가하고 싶으면 scalar_rewards = [0.0] 부분만 실제 reward 함수로 교체하면 됩니다. GRPO + OPD 조합이 그대로 유지됩니다.
-2. 아키텍처 요구사항: slime의 training loop은 반드시 advantage estimator가 지정되어야 합니다. OPD 자체는 별도 estimator가 아니므로 어떤 estimator든 하나를 골라야 합니다.
-3. 순수 KD만 원한다면 GRPO는 사실 dummy 역할을 하는 것이고, 실제 학습 신호는 100% OPD KL에서 옵니다.
-
 ---
 
 ## 5. 왜 GRPO를 Advantage Estimator로 사용하는가
 
 README에 명시된 대로 OPD는 advantage estimator와 **직교(orthogonal)**합니다:
+
 > "OPD works as an additive KL penalty on top of any advantage estimator (GRPO, PPO, REINFORCE++, etc.), not as a separate estimator."
 
+즉 OPD는 advantage estimator를 대체하는 게 아니라 그 위에 더해지는 구조입니다. GRPO를 쓰든, PPO를 쓰든 상관없이 동작합니다.
+
 reward=0.0(고정)이므로 GRPO base advantage는 사실상 0이 되고:
-- A_modified[t] = 0 − coef × (log π_S[t] − log π_T[t]) = −reverse_KL[t]
-- 학습 신호 100%가 OPD KL에서 나옴
+
+```
+A_base[t]    ≈ 0  (모든 샘플 reward가 동일하게 0이므로 GRPO 정규화 후 0)
+A_modified[t] = 0 − coef × (log π_S[t] − log π_T[t]) = −reverse_KL[t]
+```
+
+결과적으로 학습 신호 100%가 OPD KL에서 나옵니다.
 
 GRPO를 선택한 이유:
-1. **확장성**: task reward를 나중에 추가하면 GRPO+OPD 조합이 그대로 동작
-2. **아키텍처 요구사항**: slime training loop은 advantage estimator가 반드시 필요, OPD 자체는 estimator가 아니므로 dummy로 하나를 지정
-3. 어떤 estimator를 골라도 동일하게 동작
+
+1. **확장성**: task reward를 나중에 추가하면 `scalar_rewards = [0.0]` 부분만 실제 reward 함수로 교체하면 됩니다. GRPO+OPD 조합이 그대로 유지됩니다.
+2. **아키텍처 요구사항**: slime training loop은 advantage estimator가 반드시 필요합니다. OPD 자체는 별도 estimator가 아니므로 어떤 estimator든 dummy로 하나를 지정해야 합니다.
+3. **동등성**: 어떤 estimator를 골라도 reward=0.0 조건에서 동일하게 동작합니다.
+
+---
+
+## 6. Off-Policy 구현 검증
+
+`--load-debug-rollout-data`로 PT 파일을 로드하는 off-policy KD 실행 시 student logit 계산이 올바르게 이루어지는지 코드 흐름을 단계별로 추적합니다.
+
+### ① PT 로드 → rollout_data 구성 (`rollout.py:549-555`, `rollout.py:724-725`)
+
+```python
+rollout_data["tokens"]            = [prompt_ids + student_response_ids]  # PT에서 복원
+rollout_data["response_lengths"]  = [response lengths]
+rollout_data["teacher_log_probs"] = [tensor per sample]   # PT에서 복원 ✓
+rollout_data["rollout_log_probs"] = [tensor per sample]   # 구 rollout 시점 student logprobs
+rollout_data["rewards"]           = [0.0, ...]
+```
+
+> PT 파일에는 on-policy rollout 당시 student가 생성한 응답이 담기고, teacher는 그 student 응답에 대해 scoring → `teacher_log_probs`가 저장됨.
+
+### ② student 현재 log probs 계산 (`actor.py:432-445`)
+
+```python
+self._switch_model("actor")
+if not self.args.use_rollout_logprobs or ...:
+    rollout_data.update(
+        self.compute_log_prob(data_iterator, ..., store_prefix="")
+        # forward_only(get_log_probs_and_entropy, ...) 호출
+        # → rollout_data["log_probs"] = 현재 student weight로 계산한 log probs
+    )
+```
+
+`forward_only` (`model.py:295`): `rollout_data[f"{store_prefix}{key}"] = values` — `store_prefix=""` 이므로 `rollout_data["log_probs"]`에 저장됩니다. **이 단계가 student logit 계산의 핵심입니다.** ✓
+
+### ③ advantage 계산 (`loss.py:421`, `loss.py:496-500`)
+
+```python
+# compute_advantages_and_returns
+log_probs = rollout_data.get("log_probs")   # ← ②에서 방금 계산한 student log probs
+
+apply_opd_kl_to_advantages(
+    ...
+    student_log_probs=log_probs,            # student 현재 log probs
+    # rollout_data["teacher_log_probs"]도 여기서 사용
+)
+# → reverse_kl    = student_log_probs[i] - teacher_log_probs[i]
+# → advantages[i] = 0 - 1.0 * reverse_kl  = -reverse_kl
+```
+
+✓
+
+### ④ policy gradient backward (`loss.py:644-706`)
+
+```python
+old_log_probs = batch["log_probs"]           # ②에서 계산한 student log probs (detached)
+log_probs     = get_log_probs_and_entropy()  # backward pass용 student log probs (with grad)
+ppo_kl        = old_log_probs - log_probs    # ≈ 0 at step 시작, PPO clip용 ratio
+ratio         = exp(-ppo_kl)
+pg_loss       = -ratio.clamp(...) * advantages   # clipped policy gradient
+```
+
+✓
+
+### 주의: `rollout_log_probs`의 의미
+
+PT 파일에는 rollout 당시 student의 log probs (`sample.rollout_log_probs`)도 포함되어 있어 `rollout_data["rollout_log_probs"]`에 로드됩니다. 스크립트에서 `--use-rollout-logprobs`가 없으므로 이것은 policy gradient에 **사용되지 않고**, `train_rollout_logprob_abs_diff` 메트릭 계산(`loss.py:796-798`)에만 쓰입니다.
+
+현재 student weights(②)와 rollout 당시 old policy(`rollout_log_probs`) 간의 drift 지표로만 기록되며 학습에는 영향 없습니다. ✓
+
+### 최종 결론
+
+student logit 계산(`compute_log_prob` → `forward_only` → `get_log_probs_and_entropy`)은 `compute_advantages_and_returns` 호출 **전**에 매 training step마다 정확히 실행되고 있습니다. 코드에 문제 없습니다.
