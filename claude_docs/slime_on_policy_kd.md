@@ -248,3 +248,54 @@ PT 파일에는 rollout 당시 student의 log probs (`sample.rollout_log_probs`)
 ### 최종 결론
 
 student logit 계산(`compute_log_prob` → `forward_only` → `get_log_probs_and_entropy`)은 `compute_advantages_and_returns` 호출 **전**에 매 training step마다 정확히 실행되고 있습니다. 코드에 문제 없습니다.
+
+---
+
+## 7. GPU 배치 구조
+
+> `examples/on_policy_distillation/run-qwen3-8B-opd.sh` 기준 (8 GPU 머신)
+
+```
+GPU 0-1  : Actor model (Megatron, TP=2)           ← training
+           + Reference model (동일 GPU 공유, CPU pinned memory로 스위칭)
+GPU 2-5  : Student rollout model (SGLang, 4 engines)  ← --rollout-num-gpus 4
+GPU 7    : Teacher model (Qwen3-32B, standalone SGLang server, 별도 프로세스)
+```
+
+### Reference model이 actor GPU에 같이 올라가는 방식
+
+`load_other_checkpoint("ref", args.ref_load)`가 actor와 **동일한 Megatron model 객체**에 ref 체크포인트를 로드한 뒤, `weights_backuper.backup("ref")`로 해당 weights를 **CPU pinned memory**에 복사합니다 (`tensor_backper.py:59`).
+
+```python
+# _TensorBackuperNormal.backup()
+backup_dict[name] = torch.empty_like(param, device=torch.device("cpu"), pin_memory=True)
+backup_dict[name].copy_(param.detach(), non_blocking=True)
+```
+
+학습 중에는 `_switch_model("ref")` → `restore("ref")`로 CPU pinned memory에서 GPU로 복원하고, 끝나면 `_switch_model("actor")`로 다시 actor weights를 복원합니다. **GPU 메모리는 하나인데 actor/ref가 교대로 점유**하는 구조입니다.
+
+```
+_switch_model("ref")   → CPU pinned memory → GPU  (ref forward pass: ref log probs 계산)
+_switch_model("actor") → CPU pinned memory → GPU  (actor training step)
+```
+
+이 스크립트에서 `with_ref` 조건은:
+```python
+with_ref = args.kl_coef != 0 or args.use_kl_loss   # --use-kl-loss 플래그가 있으므로 True
+```
+`--kl-loss-coef 0.00`이지만 `--use-kl-loss` 플래그가 설정되어 있어 `use_kl_loss=True` → `with_ref=True`가 됩니다.
+
+### `--rollout-num-gpus 4`의 SGLang은 teacher가 아니라 student
+
+| 항목 | GPU | 설명 |
+|------|-----|------|
+| `--rollout-num-gpus 4` | GPU 2-5 | **Student** Qwen3-8B, rollout 생성용 SGLang engines |
+| `CUDA_VISIBLE_DEVICES=7` SGLang server | GPU 7 | **Teacher** Qwen3-32B, 별도 standalone 프로세스로 미리 기동 |
+| `--rm-url http://...13141/generate` | — | Teacher server로 custom reward 함수가 HTTP 요청하는 엔드포인트 |
+
+OPD(`--opd-type sglang`)에서 rollout server는 **student가 응답을 생성**하는 곳이고, teacher는 `--custom-rm-path`의 reward function이 log prob을 계산하기 위해 HTTP로 호출하는 **별도 서버**입니다. `opd-type megatron`이었다면 teacher를 Megatron으로 actor GPU에 올리지만, `sglang` 타입이므로 외부 서버로 분리됩니다.
+
+```python
+# placement_group.py
+with_opd_teacher = args.use_opd and args.opd_type == "megatron"  # sglang이므로 False
+```
